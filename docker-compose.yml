@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  downloader-api:
+    build: .
+    ports:
+      - "8080:8080"  # Expose API port
+    volumes:
+      - ./downloads:/root/freepik_downloads
+    shm_size: '2gb'
+    environment:
+      - PORT=8080

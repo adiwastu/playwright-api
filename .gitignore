@@ -1,0 +1,25 @@
+# Binaries
+downloader
+*.exe
+*.dll
+
+# Downloads folder (optional - you might want to keep it empty in repo)
+downloads/*
+
+# Docker
+.dockerignore
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Go - ONLY ignore these:
+/bin/
+/out/
+*.test
