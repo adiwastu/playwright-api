@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,22 +10,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/playwright-community/playwright-go"
 )
 
 // Global variables
 var (
 	browser    playwright.Browser
-	browserCtx playwright.BrowserContext
+	context    playwright.BrowserContext
 	contextMux sync.RWMutex
 	isLoggedIn bool
-	s3Client   *s3.Client
-	uploader   *manager.Uploader
 )
 
 type DownloadRequest struct {
@@ -39,7 +30,6 @@ type DownloadResponse struct {
 	Message string `json:"message"`
 	File    string `json:"file,omitempty"`
 	Error   string `json:"error,omitempty"`
-	R2URL   string `json:"r2_url,omitempty"`
 }
 
 type LoginRequest struct {
@@ -54,11 +44,6 @@ type LoginResponse struct {
 }
 
 func main() {
-	// Initialize R2 uploader
-	if err := initR2Client(); err != nil {
-		log.Fatalf("❌ Failed to initialize R2 client: %v", err)
-	}
-
 	log.Println("1. Starting Playwright Core...")
 	pw, err := playwright.Run()
 	if err != nil {
@@ -83,7 +68,7 @@ func main() {
 	storageStateFile := getStorageStatePath()
 	if _, err := os.Stat(storageStateFile); err == nil {
 		log.Println("📁 Loading existing storage state...")
-		browserCtx, err = browser.NewContext(playwright.BrowserNewContextOptions{
+		context, err = browser.NewContext(playwright.BrowserNewContextOptions{
 			StorageStatePath: playwright.String(storageStateFile),
 		})
 		if err != nil {
@@ -110,97 +95,10 @@ func main() {
 	}
 }
 
-// initR2Client sets up the S3-compatible client for Cloudflare R2
-// This uses AWS SDK v2's Functional Options Pattern for configuration
-func initR2Client() error {
-	// Get R2 credentials from environment variables
-	accountID := getEnv("R2_ACCOUNT_ID", "")
-	accessKeyID := getEnv("R2_ACCESS_KEY_ID", "")
-	secretAccessKey := getEnv("R2_SECRET_ACCESS_KEY", "")
-
-	if accountID == "" || accessKeyID == "" || secretAccessKey == "" {
-		return fmt.Errorf("R2 credentials not set. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY")
-	}
-
-	// Construct R2 endpoint
-	endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
-
-	// Create custom resolver for R2 endpoint
-	// This is the Adapter Pattern - adapting AWS SDK to work with R2
-	customResolver := aws.EndpointResolverWithOptionsFunc(
-		func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               endpoint,
-				SigningRegion:     "auto",
-				HostnameImmutable: true,
-			}, nil
-		},
-	)
-
-	// Load config with custom settings
-	// The Functional Options Pattern allows flexible configuration
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithEndpointResolverWithOptions(customResolver),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			accessKeyID,
-			secretAccessKey,
-			"", // session token not needed for R2
-		)),
-		config.WithRegion("auto"), // R2 uses "auto" as region
-	)
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %v", err)
-	}
-
-	// Create S3 client with R2-specific options
-	s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true // Required for R2 compatibility
-	})
-
-	// Create uploader with custom concurrency settings
-	// This is the Builder Pattern - constructing complex upload configurations
-	uploader = manager.NewUploader(s3Client, func(u *manager.Uploader) {
-		u.PartSize = 10 * 1024 * 1024 // 10MB parts for multipart uploads
-		u.Concurrency = 5             // Upload 5 parts concurrently
-	})
-
-	log.Println("✅ R2 client initialized successfully")
-	return nil
-}
-
-// uploadToR2 streams file data directly to R2 without local storage
-// This uses the Stream Processing pattern - processing data as it flows
-func uploadToR2(reader io.Reader, filename string) (string, error) {
-	bucketName := getEnv("R2_BUCKET_NAME", "freepik-downloads")
-
-	// Generate unique key using timestamp to avoid collisions
-	timestamp := time.Now().Format("2006-01-02")
-	key := fmt.Sprintf("%s/%s", timestamp, filename)
-
-	log.Printf("📤 Uploading to R2: %s/%s", bucketName, key)
-
-	// Upload directly from the reader stream
-	// Context pattern for timeout and cancellation control
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	result, err := uploader.Upload(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
-		Body:   reader,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to upload to R2: %v", err)
-	}
-
-	log.Printf("✅ Upload complete: %s", result.Location)
-	return result.Location, nil
-}
-
 func createNewContext() {
 	log.Println("🆕 Creating new browser context...")
 	var err error
-	browserCtx, err = browser.NewContext(playwright.BrowserNewContextOptions{
+	context, err = browser.NewContext(playwright.BrowserNewContextOptions{
 		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 		Viewport: &playwright.Size{
 			Width:  1920,
@@ -238,6 +136,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Use default credentials if not provided
 	if req.Email == "" {
 		req.Email = "mymymy@gmail.com"
 	}
@@ -261,12 +160,13 @@ func performLogin(email, password string) error {
 
 	log.Println("🌐 Starting login sequence...")
 
-	page, err := browserCtx.NewPage()
+	page, err := context.NewPage()
 	if err != nil {
 		return fmt.Errorf("failed to create page: %v", err)
 	}
 	defer page.Close()
 
+	// Inject stealth scripts
 	if err := page.AddInitScript(playwright.Script{
 		Content: playwright.String(`
 			Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -277,6 +177,7 @@ func performLogin(email, password string) error {
 		return fmt.Errorf("failed to inject stealth scripts: %v", err)
 	}
 
+	// Step 1: Go to Freepik homepage
 	log.Println("1. Navigating to Freepik homepage...")
 	if _, err := page.Goto("https://www.freepik.com", playwright.PageGotoOptions{
 		Timeout:   playwright.Float(30000),
@@ -286,6 +187,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(2 * time.Second)
 
+	// Step 2: Click "Sign In" button
 	log.Println("2. Looking for 'Sign In' button...")
 	signInSelector := `button:has-text("Sign In"), a:has-text("Sign In"), [data-testid="login-button"]`
 	if err := page.Click(signInSelector, playwright.PageClickOptions{
@@ -295,6 +197,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(3 * time.Second)
 
+	// Step 3: Click "Continue with email" button
 	log.Println("3. Looking for 'Continue with email' button...")
 	continueWithEmailSelector := `button:has-text("Continue with email"), button:has-text("Log in with email")`
 	if err := page.Click(continueWithEmailSelector, playwright.PageClickOptions{
@@ -304,7 +207,10 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(2 * time.Second)
 
+	// Step 4: Fill email and password
 	log.Println("4. Filling login form...")
+
+	// Fill email
 	emailSelector := `input[type="email"], input[name="email"], #email`
 	if err := page.Fill(emailSelector, email, playwright.PageFillOptions{
 		Timeout: playwright.Float(10000),
@@ -313,6 +219,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(1 * time.Second)
 
+	// Fill password
 	passwordSelector := `input[type="password"], input[name="password"], #password`
 	if err := page.Fill(passwordSelector, password, playwright.PageFillOptions{
 		Timeout: playwright.Float(10000),
@@ -321,6 +228,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(1 * time.Second)
 
+	// Step 5: Check "Stay logged in" checkbox
 	log.Println("5. Checking 'Stay logged in' checkbox...")
 	stayLoggedInSelector := `input[type="checkbox"][name="remember"], input[type="checkbox"]#remember, .remember-me input`
 	if visible, _ := page.IsVisible(stayLoggedInSelector); visible {
@@ -332,6 +240,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(1 * time.Second)
 
+	// Step 6: Click "Log in" button
 	log.Println("6. Clicking 'Log in' button...")
 	loginButtonSelector := `button[type="submit"]:has-text("Log in"), button:has-text("Login"), input[type="submit"][value="Log in"]`
 	if err := page.Click(loginButtonSelector, playwright.PageClickOptions{
@@ -340,12 +249,15 @@ func performLogin(email, password string) error {
 		return fmt.Errorf("failed to click login button: %v", err)
 	}
 
+	// Step 7: Wait for login to complete
 	log.Println("7. Waiting for login to complete...")
 	time.Sleep(5 * time.Second)
 
+	// Verify login was successful by checking if we're redirected away from login page
 	currentURL := page.URL()
 	log.Printf("Current URL after login: %s", currentURL)
 
+	// Check for login success indicators
 	loginSuccess := false
 	successSelectors := []string{
 		`[data-testid="user-avatar"]`,
@@ -362,9 +274,11 @@ func performLogin(email, password string) error {
 	}
 
 	if !loginSuccess {
+		// Check if we're still on a login page
 		if page.URL() == "https://www.freepik.com/login" || page.URL() == "https://www.freepik.com/sign-in" {
 			return fmt.Errorf("login failed - still on login page")
 		}
+		// Try to detect error messages
 		errorSelectors := []string{
 			`.error-message`,
 			`[role="alert"]`,
@@ -379,9 +293,10 @@ func performLogin(email, password string) error {
 		}
 	}
 
+	// Step 8: Save storage state
 	log.Println("8. Saving storage state...")
 	storageStateFile := getStorageStatePath()
-	if _, err := browserCtx.StorageState(storageStateFile); err != nil {
+	if _, err := context.StorageState(storageStateFile); err != nil {
 		return fmt.Errorf("failed to save storage state: %v", err)
 	}
 
@@ -409,6 +324,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("📥 Received download request for: %s", req.URL)
 
+	// Check if we're logged in
 	contextMux.RLock()
 	loggedIn := isLoggedIn
 	contextMux.RUnlock()
@@ -454,7 +370,7 @@ func processDownload(targetURL string) {
 
 func runDownload(targetURL string) error {
 	contextMux.RLock()
-	currentContext := browserCtx
+	currentContext := context
 	contextMux.RUnlock()
 
 	log.Println("3. Creating new page from logged-in context...")
@@ -476,6 +392,16 @@ func runDownload(targetURL string) error {
 	}
 
 	const downloadButtonSelector = `button:has-text("Download")`
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "."
+	}
+	downloadPath := filepath.Join(homeDir, "freepik_downloads")
+
+	if err := os.MkdirAll(downloadPath, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create download directory: %v", err)
+	}
 
 	log.Printf("5. Navigating to %s...", targetURL)
 	if _, err := page.Goto(targetURL, playwright.PageGotoOptions{
@@ -501,8 +427,6 @@ func runDownload(targetURL string) error {
 	}
 
 	log.Println("7. Clicking the 'Download' button...")
-
-	// This uses the Callback Pattern - ExpectDownload takes a function to execute
 	download, err := page.ExpectDownload(func() error {
 		return page.Click(downloadButtonSelector, playwright.PageClickOptions{
 			Timeout: playwright.Float(30000),
@@ -513,38 +437,12 @@ func runDownload(targetURL string) error {
 	}
 
 	filename := download.SuggestedFilename()
+	saveFileTo := filepath.Join(downloadPath, filename)
 
-	// Create temporary file - this uses the Temporary Resource Pattern
-	// The file is automatically cleaned up after upload
-	tmpFile, err := os.CreateTemp("", "freepik-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %v", err)
-	}
-	tmpPath := tmpFile.Name()
-	tmpFile.Close()          // Close immediately so Playwright can write to it
-	defer os.Remove(tmpPath) // Ensure cleanup even if upload fails
-
-	log.Println("8. Saving download to temporary file...")
-	if err := download.SaveAs(tmpPath); err != nil {
-		return fmt.Errorf("failed to save download: %v", err)
+	if err := download.SaveAs(saveFileTo); err != nil {
+		return fmt.Errorf("failed to save file: %v", err)
 	}
 
-	log.Println("9. Streaming file to R2...")
-	// Open file for reading and stream to R2
-	file, err := os.Open(tmpPath)
-	if err != nil {
-		return fmt.Errorf("failed to open temp file: %v", err)
-	}
-	defer file.Close()
-
-	// Upload from file stream - temp file is deleted after this function returns
-	r2URL, err := uploadToR2(file, filename)
-	if err != nil {
-		return fmt.Errorf("failed to upload to R2: %v", err)
-	}
-
-	log.Printf("✅ File uploaded to R2: %s", r2URL)
-	log.Printf("🗑️  Temporary file cleaned up: %s", tmpPath)
 	return nil
 }
 
