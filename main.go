@@ -348,7 +348,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if we're logged in
 	contextMux.RLock()
 	loggedIn := isLoggedIn
-	email := currentUserEmail
 	contextMux.RUnlock()
 
 	if !loggedIn {
