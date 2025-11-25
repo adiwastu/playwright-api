@@ -357,7 +357,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Generate the URL and Key immediately
-	publicURL, r2ObjectKey := generateR2Path(req.URL, email)
+	publicURL, r2ObjectKey := generateR2Path(req.URL, req.Email)
 
 	go processDownload(req.URL, r2ObjectKey)
 
