@@ -396,7 +396,7 @@ func processDownload(targetURL, r2Key string) {
 	log.Printf("✅ Local download complete: %s", localFilePath)
 
 	// 2. Upload to R2
-	if err := uploadToR2(targetURL, r2Key); err != nil {
+	if err := uploadToR2(localFilePath, r2Key); err != nil {
 		log.Printf("❌ R2 Upload failed: %v", err)
 		return
 	}
