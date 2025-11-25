@@ -421,8 +421,8 @@ func generateR2Path(originalURL, email string) (string, string) {
 		nameWithoutExt = strings.Join(parts[:len(parts)-1], "_")
 	}
 
-	// Force .jpg
-	finalFilename := nameWithoutExt + ".jpg"
+	// Force .zip
+	finalFilename := nameWithoutExt + ".zip"
 
 	// 2. USE RAW EMAIL (No Escaping)
 	// S3/R2 handles '@' fine. This creates a folder literally named "user@email.com"
