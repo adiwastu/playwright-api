@@ -10,19 +10,27 @@ import (
 	"sync"
 	"time"
 
+	"context"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"github.com/playwright-community/playwright-go"
 )
 
 // Global variables
 var (
-	browser    playwright.Browser
-	context    playwright.BrowserContext
-	contextMux sync.RWMutex
-	isLoggedIn bool
+	browser        playwright.Browser
+	browserContext playwright.BrowserContext
+	contextMux     sync.RWMutex
+	isLoggedIn     bool
 )
 
 type DownloadRequest struct {
-	URL string `json:"url"`
+	URL   string `json:"url"`
+	Email string `json:"email"`
 }
 
 type DownloadResponse struct {
@@ -68,7 +76,7 @@ func main() {
 	storageStateFile := getStorageStatePath()
 	if _, err := os.Stat(storageStateFile); err == nil {
 		log.Println("📁 Loading existing storage state...")
-		context, err = browser.NewContext(playwright.BrowserNewContextOptions{
+		browserContext, err = browser.NewContext(playwright.BrowserNewContextOptions{
 			StorageStatePath: playwright.String(storageStateFile),
 		})
 		if err != nil {
@@ -98,7 +106,7 @@ func main() {
 func createNewContext() {
 	log.Println("🆕 Creating new browser context...")
 	var err error
-	context, err = browser.NewContext(playwright.BrowserNewContextOptions{
+	browserContext, err = browser.NewContext(playwright.BrowserNewContextOptions{
 		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 		Viewport: &playwright.Size{
 			Width:  1920,
@@ -160,7 +168,7 @@ func performLogin(email, password string) error {
 
 	log.Println("🌐 Starting login sequence...")
 
-	page, err := context.NewPage()
+	page, err := browserContext.NewPage()
 	if err != nil {
 		return fmt.Errorf("failed to create page: %v", err)
 	}
@@ -296,7 +304,7 @@ func performLogin(email, password string) error {
 	// Step 8: Save storage state
 	log.Println("8. Saving storage state...")
 	storageStateFile := getStorageStatePath()
-	if _, err := context.StorageState(storageStateFile); err != nil {
+	if _, err := browserContext.StorageState(storageStateFile); err != nil {
 		return fmt.Errorf("failed to save storage state: %v", err)
 	}
 
@@ -322,6 +330,11 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Email == "" {
+		errorResponse(w, "Email is required for file storage", http.StatusBadRequest)
+		return
+	}
+
 	log.Printf("📥 Received download request for: %s", req.URL)
 
 	// Check if we're logged in
@@ -334,11 +347,11 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go processDownload(req.URL)
+	go processDownload(req.URL, req.Email)
 
 	jsonResponse(w, DownloadResponse{
 		Success: true,
-		Message: "Download started in background",
+		Message: fmt.Sprintf("Download started for %s", req.Email),
 	})
 }
 
@@ -357,26 +370,84 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func processDownload(targetURL string) {
-	log.Printf("🚀 Starting download process for: %s", targetURL)
+func processDownload(targetURL string, userEmail string) {
+	log.Printf("🚀 Starting download process for: %s (User: %s)", targetURL, userEmail)
 
-	if err := runDownload(targetURL); err != nil {
+	// 1. Download locally
+	localFilePath, err := runDownload(targetURL)
+	if err != nil {
 		log.Printf("❌ Download failed for %s: %v", targetURL, err)
 		return
 	}
 
-	log.Printf("✅ Download completed for: %s", targetURL)
+	log.Printf("✅ Local download complete: %s", localFilePath)
+
+	// 2. Upload to R2
+	// The object key will be: "bob@example.com/filename.jpg"
+	fileName := filepath.Base(localFilePath)
+	objectKey := fmt.Sprintf("%s/%s", userEmail, fileName)
+
+	if err := uploadToR2(localFilePath, objectKey); err != nil {
+		log.Printf("❌ R2 Upload failed: %v", err)
+		return
+	}
+
+	log.Printf("☁️ Successfully uploaded to R2: %s", objectKey)
+
+	// 3. Clean up local file
+	os.Remove(localFilePath)
 }
 
-func runDownload(targetURL string) error {
+func uploadToR2(localPath, objectKey string) error {
+	accountId := getEnv("R2_ACCOUNT_ID", "")
+	accessKey := getEnv("R2_ACCESS_KEY", "")
+	secretKey := getEnv("R2_SECRET_KEY", "")
+	bucketName := getEnv("R2_BUCKET_NAME", "")
+
+	// Create S3 Client (R2 is S3 compatible)
+	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL: fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountId),
+		}, nil
+	})
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithEndpointResolverWithOptions(r2Resolver),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+		config.WithRegion("auto"), // R2 ignores region, but SDK requires it
+	)
+	if err != nil {
+		return err
+	}
+
+	client := s3.NewFromConfig(cfg)
+
+	// Open local file
+	file, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Upload
+	_, err = client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(objectKey), // This is "email/filename.jpg"
+		Body:   file,
+	})
+
+	return err
+}
+
+func runDownload(targetURL string) (string, error) {
 	contextMux.RLock()
-	currentContext := context
+	currentContext := browserContext
 	contextMux.RUnlock()
 
 	log.Println("3. Creating new page from logged-in context...")
 	page, err := currentContext.NewPage()
 	if err != nil {
-		return fmt.Errorf("failed to create new page: %v", err)
+		return "", fmt.Errorf("failed to create new page: %v", err)
 	}
 	defer page.Close()
 
@@ -388,7 +459,7 @@ func runDownload(targetURL string) error {
 			Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 		`),
 	}); err != nil {
-		return fmt.Errorf("failed to inject stealth scripts: %v", err)
+		return "", fmt.Errorf("failed to inject stealth scripts: %v", err)
 	}
 
 	const downloadButtonSelector = `button:has-text("Download")`
@@ -400,7 +471,7 @@ func runDownload(targetURL string) error {
 	downloadPath := filepath.Join(homeDir, "freepik_downloads")
 
 	if err := os.MkdirAll(downloadPath, os.ModePerm); err != nil {
-		return fmt.Errorf("failed to create download directory: %v", err)
+		return "", fmt.Errorf("failed to create download directory: %v", err)
 	}
 
 	log.Printf("5. Navigating to %s...", targetURL)
@@ -408,22 +479,22 @@ func runDownload(targetURL string) error {
 		Timeout:   playwright.Float(60000),
 		WaitUntil: playwright.WaitUntilStateNetworkidle,
 	}); err != nil {
-		return fmt.Errorf("failed to navigate to page: %v", err)
+		return "", fmt.Errorf("failed to navigate to page: %v", err)
 	}
 
 	time.Sleep(3 * time.Second)
 
 	title, err := page.Title()
 	if err != nil {
-		return fmt.Errorf("failed to get page title: %v", err)
+		return "", fmt.Errorf("failed to get page title: %v", err)
 	}
 	if title == "Access Denied" || title == "Just a moment..." {
-		return fmt.Errorf("page blocked by anti-bot protection")
+		return "", fmt.Errorf("page blocked by anti-bot protection")
 	}
 
 	log.Println("6. Looking for download button...")
 	if visible, _ := page.IsVisible(downloadButtonSelector); !visible {
-		return fmt.Errorf("download button not found")
+		return "", fmt.Errorf("download button not found")
 	}
 
 	log.Println("7. Clicking the 'Download' button...")
@@ -433,17 +504,17 @@ func runDownload(targetURL string) error {
 		})
 	})
 	if err != nil {
-		return fmt.Errorf("failed to click download button: %v", err)
+		return "", fmt.Errorf("failed to click download button: %v", err)
 	}
 
 	filename := download.SuggestedFilename()
 	saveFileTo := filepath.Join(downloadPath, filename)
 
 	if err := download.SaveAs(saveFileTo); err != nil {
-		return fmt.Errorf("failed to save file: %v", err)
+		return "", fmt.Errorf("failed to save file: %v", err)
 	}
 
-	return nil
+	return saveFileTo, nil
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
