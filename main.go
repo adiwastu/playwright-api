@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,10 +24,11 @@ import (
 
 // Global variables
 var (
-	browser        playwright.Browser
-	browserContext playwright.BrowserContext
-	contextMux     sync.RWMutex
-	isLoggedIn     bool
+	browser          playwright.Browser
+	browserContext   playwright.BrowserContext
+	contextMux       sync.RWMutex
+	isLoggedIn       bool
+	currentUserEmail string
 )
 
 type DownloadRequest struct {
@@ -148,6 +151,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if req.Email == "" {
 		req.Email = "mymymy@gmail.com"
 	}
+
+	contextMux.Lock()
+	currentUserEmail = req.Email
+	contextMux.Unlock()
+
 	if req.Password == "" {
 		req.Password = "mypassword"
 	}
@@ -340,6 +348,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if we're logged in
 	contextMux.RLock()
 	loggedIn := isLoggedIn
+	email := currentUserEmail
 	contextMux.RUnlock()
 
 	if !loggedIn {
@@ -347,11 +356,15 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go processDownload(req.URL, req.Email)
+	// 1. Generate the URL and Key immediately
+	publicURL, r2ObjectKey := generateR2Path(req.URL, email)
+
+	go processDownload(req.URL, r2ObjectKey)
 
 	jsonResponse(w, DownloadResponse{
 		Success: true,
-		Message: fmt.Sprintf("Download started for %s", req.Email),
+		Message: "Download started",
+		File:    publicURL, // The constructed URL
 	})
 }
 
@@ -370,8 +383,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func processDownload(targetURL string, userEmail string) {
-	log.Printf("🚀 Starting download process for: %s (User: %s)", targetURL, userEmail)
+func processDownload(targetURL, r2Key string) {
+	log.Printf("🚀 Starting download for %s -> Key: %s", targetURL, r2Key)
 
 	// 1. Download locally
 	localFilePath, err := runDownload(targetURL)
@@ -383,19 +396,49 @@ func processDownload(targetURL string, userEmail string) {
 	log.Printf("✅ Local download complete: %s", localFilePath)
 
 	// 2. Upload to R2
-	// The object key will be: "bob@example.com/filename.jpg"
-	fileName := filepath.Base(localFilePath)
-	objectKey := fmt.Sprintf("%s/%s", userEmail, fileName)
-
-	if err := uploadToR2(localFilePath, objectKey); err != nil {
+	if err := uploadToR2(targetURL, r2Key); err != nil {
 		log.Printf("❌ R2 Upload failed: %v", err)
 		return
 	}
 
-	log.Printf("☁️ Successfully uploaded to R2: %s", objectKey)
+	log.Printf("✅ Upload complete: %s", r2Key)
 
 	// 3. Clean up local file
 	os.Remove(localFilePath)
+}
+
+func generateR2Path(originalURL, email string) (string, string) {
+	// 1. Parse the URL to get the slug
+	// input: https://www.freepik.com/free-ai-image/braided-brown-hair_419054525.htm
+	parsed, _ := url.Parse(originalURL)
+	baseName := filepath.Base(parsed.Path) // braided-brown-hair_419054525.htm
+
+	// Remove extension (.htm)
+	ext := filepath.Ext(baseName)
+	nameWithoutExt := baseName[0 : len(baseName)-len(ext)]
+
+	// Remove the ID (the numbers after the last underscore)
+	// This logic assumes the format ends in _12345
+	parts := strings.Split(nameWithoutExt, "_")
+	if len(parts) > 1 {
+		nameWithoutExt = strings.Join(parts[:len(parts)-1], "_")
+	}
+
+	// Force .jpg (Modify this logic if you handle vectors/zips)
+	finalFilename := nameWithoutExt + ".jpg"
+
+	// 2. URL Encode the email
+	encodedEmail := url.QueryEscape(email)
+
+	// 3. Construct the full URL
+	// Format: R2_URL / encoded_email / filename
+	r2Base := getEnv("R2_URL", "https://storage.stokbro.net")
+	fullURL := fmt.Sprintf("%s/%s/%s", strings.TrimRight(r2Base, "/"), encodedEmail, finalFilename)
+
+	// Return the Full URL for the user, and the Object Key for R2
+	objectKey := fmt.Sprintf("%s/%s", encodedEmail, finalFilename)
+
+	return fullURL, objectKey
 }
 
 func uploadToR2(localPath, objectKey string) error {
