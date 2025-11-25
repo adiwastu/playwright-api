@@ -408,34 +408,36 @@ func processDownload(targetURL, r2Key string) {
 
 func generateR2Path(originalURL, email string) (string, string) {
 	// 1. Parse the URL to get the slug
-	// input: https://www.freepik.com/free-ai-image/braided-brown-hair_419054525.htm
 	parsed, _ := url.Parse(originalURL)
-	baseName := filepath.Base(parsed.Path) // braided-brown-hair_419054525.htm
+	baseName := filepath.Base(parsed.Path)
 
 	// Remove extension (.htm)
 	ext := filepath.Ext(baseName)
 	nameWithoutExt := baseName[0 : len(baseName)-len(ext)]
 
 	// Remove the ID (the numbers after the last underscore)
-	// This logic assumes the format ends in _12345
 	parts := strings.Split(nameWithoutExt, "_")
 	if len(parts) > 1 {
 		nameWithoutExt = strings.Join(parts[:len(parts)-1], "_")
 	}
 
-	// Force .jpg (Modify this logic if you handle vectors/zips)
+	// Force .jpg
 	finalFilename := nameWithoutExt + ".jpg"
 
-	// 2. URL Encode the email
-	encodedEmail := url.QueryEscape(email)
+	// 2. USE RAW EMAIL (No Escaping)
+	// S3/R2 handles '@' fine. This creates a folder literally named "user@email.com"
+	folderName := email
 
-	// 3. Construct the full URL
-	// Format: R2_URL / encoded_email / filename
+	// 3. Construct the full URL & Object Key
 	r2Base := getEnv("R2_URL", "https://storage.stokbro.net")
-	fullURL := fmt.Sprintf("%s/%s/%s", strings.TrimRight(r2Base, "/"), encodedEmail, finalFilename)
+	r2Base = strings.TrimRight(r2Base, "/")
 
-	// Return the Full URL for the user, and the Object Key for R2
-	objectKey := fmt.Sprintf("%s/%s", encodedEmail, finalFilename)
+	// Do not use url.JoinPath or Encode here, simply concatenate strings
+	// to preserve the literal '@' in the resulting link.
+	fullURL := fmt.Sprintf("%s/%s/%s", r2Base, folderName, finalFilename)
+
+	// The key used for storage
+	objectKey := fmt.Sprintf("%s/%s", folderName, finalFilename)
 
 	return fullURL, objectKey
 }
