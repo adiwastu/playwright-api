@@ -42,7 +42,7 @@ var (
 var (
 	// The Waiting Room (Semaphore)
 	downloadSemaphore = make(chan struct{}, MaxConcurrentDownloads)
-	
+
 	// User Limits
 	userJobCounts = make(map[string]int)
 	jobCountMux   sync.Mutex
@@ -166,6 +166,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Use default credentials if not provided
 	if req.Email == "" {
 		req.Email = "mymymy@gmail.com"
 	}
@@ -200,6 +201,7 @@ func performLogin(email, password string) error {
 	}
 	defer page.Close()
 
+	// Inject stealth scripts
 	if err := page.AddInitScript(playwright.Script{
 		Content: playwright.String(`
 			Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -210,6 +212,7 @@ func performLogin(email, password string) error {
 		return fmt.Errorf("failed to inject stealth scripts: %v", err)
 	}
 
+	// Step 1: Go to Freepik homepage
 	log.Println("1. Navigating to Freepik homepage...")
 	if _, err := page.Goto("https://www.freepik.com", playwright.PageGotoOptions{
 		Timeout:   playwright.Float(30000),
@@ -219,6 +222,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(2 * time.Second)
 
+	// Step 2: Click "Sign In" button
 	log.Println("2. Looking for 'Sign In' button...")
 	signInSelector := `button:has-text("Sign In"), a:has-text("Sign In"), [data-testid="login-button"]`
 	if err := page.Click(signInSelector, playwright.PageClickOptions{
@@ -228,6 +232,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(3 * time.Second)
 
+	// Step 3: Click "Continue with email" button
 	log.Println("3. Looking for 'Continue with email' button...")
 	continueWithEmailSelector := `button:has-text("Continue with email"), button:has-text("Log in with email")`
 	if err := page.Click(continueWithEmailSelector, playwright.PageClickOptions{
@@ -237,7 +242,10 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(2 * time.Second)
 
+	// Step 4: Fill email and password
 	log.Println("4. Filling login form...")
+
+	// Fill email
 	emailSelector := `input[type="email"], input[name="email"], #email`
 	if err := page.Fill(emailSelector, email, playwright.PageFillOptions{
 		Timeout: playwright.Float(10000),
@@ -246,6 +254,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(1 * time.Second)
 
+	// Fill password
 	passwordSelector := `input[type="password"], input[name="password"], #password`
 	if err := page.Fill(passwordSelector, password, playwright.PageFillOptions{
 		Timeout: playwright.Float(10000),
@@ -254,6 +263,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(1 * time.Second)
 
+	// Step 5: Check "Stay logged in" checkbox
 	log.Println("5. Checking 'Stay logged in' checkbox...")
 	stayLoggedInSelector := `input[type="checkbox"][name="remember"], input[type="checkbox"]#remember, .remember-me input`
 	if visible, _ := page.IsVisible(stayLoggedInSelector); visible {
@@ -265,6 +275,7 @@ func performLogin(email, password string) error {
 	}
 	time.Sleep(1 * time.Second)
 
+	// Step 6: Click "Log in" button
 	log.Println("6. Clicking 'Log in' button...")
 	loginButtonSelector := `button[type="submit"]:has-text("Log in"), button:has-text("Login"), input[type="submit"][value="Log in"]`
 	if err := page.Click(loginButtonSelector, playwright.PageClickOptions{
@@ -273,12 +284,15 @@ func performLogin(email, password string) error {
 		return fmt.Errorf("failed to click login button: %v", err)
 	}
 
+	// Step 7: Wait for login to complete
 	log.Println("7. Waiting for login to complete...")
 	time.Sleep(5 * time.Second)
 
+	// Verify login was successful by checking if we're redirected away from login page
 	currentURL := page.URL()
 	log.Printf("Current URL after login: %s", currentURL)
 
+	// Check for login success indicators
 	loginSuccess := false
 	successSelectors := []string{
 		`[data-testid="user-avatar"]`,
@@ -295,9 +309,11 @@ func performLogin(email, password string) error {
 	}
 
 	if !loginSuccess {
+		// Check if we're still on a login page
 		if page.URL() == "https://www.freepik.com/login" || page.URL() == "https://www.freepik.com/sign-in" {
 			return fmt.Errorf("login failed - still on login page")
 		}
+		// Try to detect error messages
 		errorSelectors := []string{
 			`.error-message`,
 			`[role="alert"]`,
@@ -312,6 +328,7 @@ func performLogin(email, password string) error {
 		}
 	}
 
+	// Step 8: Save storage state
 	log.Println("8. Saving storage state...")
 	storageStateFile := getStorageStatePath()
 	if _, err := browserContext.StorageState(storageStateFile); err != nil {
@@ -427,6 +444,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 func processDownload(targetURL, r2Key string) {
 	log.Printf("🚀 Starting download for %s -> Key: %s", targetURL, r2Key)
 
+	// 1. Download locally
 	localFilePath, err := runDownload(targetURL)
 	if err != nil {
 		log.Printf("❌ Download failed for %s: %v", targetURL, err)
@@ -435,6 +453,7 @@ func processDownload(targetURL, r2Key string) {
 
 	log.Printf("✅ Local download complete: %s", localFilePath)
 
+	// 2. Upload to R2
 	if err := uploadToR2(localFilePath, r2Key); err != nil {
 		log.Printf("❌ R2 Upload failed: %v", err)
 		return
@@ -442,24 +461,29 @@ func processDownload(targetURL, r2Key string) {
 
 	log.Printf("✅ Upload complete: %s", r2Key)
 
+	// 3. Clean up local file
 	os.Remove(localFilePath)
 }
 
 func generateR2Path(originalURL, email string) (string, string) {
+
+	// 1. Process Filename
 	parsed, _ := url.Parse(originalURL)
 	baseName := filepath.Base(parsed.Path)
-
 	ext := filepath.Ext(baseName)
 	nameWithoutExt := baseName[0 : len(baseName)-len(ext)]
-
 	parts := strings.Split(nameWithoutExt, "_")
 	if len(parts) > 1 {
 		nameWithoutExt = strings.Join(parts[:len(parts)-1], "_")
 	}
-
 	finalFilename := nameWithoutExt + ".zip"
-	folderName := email
 
+	// 2. Process Email (Sanitize)
+	folderName := email
+	folderName = strings.ReplaceAll(folderName, "@", "-at-")
+	folderName = strings.ReplaceAll(folderName, ".", "-dot-")
+
+	// 3. Construct Paths
 	r2Base := getEnv("R2_URL", "https://storage.stokbro.net")
 	r2Base = strings.TrimRight(r2Base, "/")
 
@@ -475,6 +499,7 @@ func uploadToR2(localPath, objectKey string) error {
 	secretKey := getEnv("R2_SECRET_KEY", "")
 	bucketName := getEnv("R2_BUCKET_NAME", "")
 
+	// Create S3 Client (R2 is S3 compatible)
 	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{
 			URL: fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountId),
@@ -492,12 +517,14 @@ func uploadToR2(localPath, objectKey string) error {
 
 	client := s3.NewFromConfig(cfg)
 
+	// Open local file
 	file, err := os.Open(localPath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
+	// Upload
 	_, err = client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(objectKey),
@@ -519,6 +546,7 @@ func runDownload(targetURL string) (string, error) {
 	}
 	defer page.Close()
 
+	log.Println("4. Injecting stealth scripts...")
 	if err := page.AddInitScript(playwright.Script{
 		Content: playwright.String(`
 			Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
