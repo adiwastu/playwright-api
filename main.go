@@ -117,6 +117,48 @@ func main() {
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/status", statusHandler)
 
+	go func() {
+		// 1. Get Credentials from ENV
+		email := getEnv("PREMIUM_EMAIL", "")
+		password := getEnv("PREMIUM_PASSWORD", "")
+
+		if email == "" || password == "" {
+			log.Println("⚠️ No auto-login credentials found in ENV. Waiting for manual login...")
+			return
+		}
+
+		// 2. Set the global email variable immediately
+		contextMux.Lock()
+		currentUserEmail = email
+		contextMux.Unlock()
+
+		// 3. Retry Loop
+		for {
+			// Check if we are already logged in (e.g. from storage state)
+			contextMux.RLock()
+			alreadyLoggedIn := isLoggedIn
+			contextMux.RUnlock()
+
+			if alreadyLoggedIn {
+				log.Println("✅ System is ready (Logged in).")
+				break // Exit the loop
+			}
+
+			log.Println("🔄 Initiating Auto-Login sequence...")
+
+			// Attempt login
+			err := performLogin(email, password)
+			if err == nil {
+				log.Println("✅ Auto-Login Successful!")
+				break // Exit the loop
+			}
+
+			log.Printf("❌ Auto-Login Failed: %v", err)
+			log.Println("⏳ Retrying in 10 seconds...")
+			time.Sleep(10 * time.Second) // Wait before retrying
+		}
+	}()
+
 	port := getEnv("PORT", "8080")
 	log.Printf("🚀 Starting download API server on port %s", port)
 
