@@ -31,11 +31,6 @@ var (
 	currentUserEmail string
 )
 
-var userJobCounts = make(map[string]int)
-var jobCountMux sync.Mutex
-
-const MaxJobsPerUser = 2
-
 type DownloadRequest struct {
 	URL   string `json:"url"`
 	Email string `json:"email"`
@@ -360,59 +355,16 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := req.Email
-    url := req.URL
-
-	// --- STEP 1: CHECK USER LIMITS ---
-    jobCountMux.Lock()
-    count := userJobCounts[email]
-    if count >= MaxJobsPerUser {
-        jobCountMux.Unlock()
-        // REJECT THE REQUEST immediately
-        errorResponse(w, fmt.Sprintf("Too many pending requests. You have %d jobs in progress. Please wait.", count), http.StatusTooManyRequests)
-        return
-    }
-    
-    // Increment their count immediately
-    userJobCounts[email]++
-    jobCountMux.Unlock()
-    // ---------------------------------
-
 	// 1. Generate the URL and Key immediately
 	publicURL, r2ObjectKey := generateR2Path(req.URL, req.Email)
-	currentJobs := len(downloadSemaphore)
 
-	// --- STEP 2: START WORKER ---
-    go func(targetURL, key, userEmail string) {
-        // ALWAYS Ensure we decrement the user's count when this finishes
-        defer func() {
-            jobCountMux.Lock()
-            userJobCounts[userEmail]--
-            // Safety check to prevent negative numbers (optional but good practice)
-            if userJobCounts[userEmail] < 0 {
-                userJobCounts[userEmail] = 0
-            }
-            jobCountMux.Unlock()
-        }()
+	go processDownload(req.URL, r2ObjectKey)
 
-        log.Printf("⏳ [Queue] User %s waiting... (%d active)", userEmail, len(downloadSemaphore))
-
-        // Wait for a server slot (Global Semaphore)
-        downloadSemaphore <- struct{}{}
-        
-        // Release server slot when done
-        defer func() { <-downloadSemaphore }()
-
-        log.Printf("▶️ [Worker] Processing %s", targetURL)
-        processDownload(targetURL, key)
-
-    }(req.URL, r2ObjectKey, email)
-
-    jsonResponse(w, DownloadResponse{
-        Success: true,
-        Message: "Request queued.",
-        File:    publicURL,
-    })
+	jsonResponse(w, DownloadResponse{
+		Success: true,
+		Message: "Download started",
+		File:    publicURL, // The constructed URL
+	})
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
